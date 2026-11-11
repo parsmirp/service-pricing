@@ -10,11 +10,17 @@
 #   Benchmarks    hourly rates by role, effective labor $/hr, fee per kW,
 #                 quoted value by vendor & cost type
 #   Vendors       vendor cards with contacts and quote history
-#   Add quote     upload PDF -> auto-parse -> review next to the PDF -> save
+#   Add quote     upload PDF / Word -> auto-parse -> review next to the file -> save
+#   Map           one marker per site, coloured by region, sized by total quoted; vendor HQs as rings;
+#                 sites / HQs without a point are placed from their city (tidygeocoder) or typed in
+#   Documents     every file under the SharePoint root (name / path / link only)
+#   Region        AMER / APAC / EMEA / LATAM on every quote and a filter on every tab
 #
-# Files:  app.R, R/parse_quote.R, R/helpers.R, R/db.R, www/ (logo)
-# Data:   service_quotes.sqlite + quote_files/ (created on first run)
+# Files:  app.R, R/parse_quote.R, R/helpers.R, R/db.R, R/sharepoint.R, R/paths.R (regions + folder
+#         layout), R/read_doc.R (Word quotes), R/sites.R (sites table + map), tools/ (first scan), www/ (logo)
+# Data:   service_quotes.sqlite + quote_files/ (created on first run), optional data/sites_seed.csv
 # Pkgs:   shiny bslib DBI RSQLite DT ggplot2 pdftools httr2 (Entra sign-in + SharePoint inbox)
+#         leaflet (Map tab) - optional: antiword (legacy .doc), tidygeocoder (placing sites and vendor HQs from their city)
 # Auth:   Microsoft Entra ID sign-in (R/auth.R), settings in entra.env
 # =============================================================================
 
@@ -22,7 +28,9 @@ suppressPackageStartupMessages({
   library(shiny); library(bslib); library(DBI); library(RSQLite)
   library(DT); library(ggplot2); library(htmltools)
 })
-for (f in c("R/auth.R", "R/helpers.R", "R/parse_quote.R", "R/db.R", "R/sharepoint.R")) source(f, local = TRUE, encoding = "UTF-8")
+for (f in c("R/auth.R", "R/helpers.R", "R/parse_quote.R", "R/paths.R", "R/read_doc.R", "R/db.R", "R/sites.R", "R/sharepoint.R"))
+  source(f, local = TRUE, encoding = "UTF-8")
+HAS_LEAFLET <- requireNamespace("leaflet", quietly = TRUE)   # the Map tab degrades to a note without it
 
 options(shiny.maxRequestSize = 50 * 1024^2)       # quotes up to 50 MB
 init_db()
@@ -56,6 +64,42 @@ empty_state <- function(title, body, ...) {
       h5(title), p(body), ...)
 }
 section_title <- function(...) div(class = "section-l", ...)
+
+# ---- regions: one chip, one colour per region, used everywhere -------------------------------
+region_chip <- function(r) {
+  r <- norm_region(if (is.null(r) || !length(r)) NA else r[1])
+  span(class = "region-chip", style = sprintf("--c:%s", region_color(r)), r)
+}
+region_chip_html <- function(r) {            # vectorised, for DataTables / map popups
+  r <- norm_region(r)
+  sprintf("<span class='region-chip' style='--c:%s'>%s</span>", region_color(r), r)
+}
+js_set <- function(id, v) sprintf("Shiny.setInputValue('%s', %s, {priority: 'event'})", id, jsonlite::toJSON(v, auto_unbox = TRUE))
+kind_label <- function(k) if (length(k) == 1 && !is.na(k) && k %in% names(DOC_KIND_LABELS)) DOC_KIND_LABELS[[k]] else "Supporting document"
+
+# Region breakdown under the KPI tiles: a split bar plus one clickable cell per region
+region_strip <- function(d, sel = character()) {
+  if (!nrow(d)) return(NULL)
+  f <- factor(d$region, REGION_LEVELS)
+  tot <- setNames(as.numeric(tapply(na0(d$base_total), f, sum)), REGION_LEVELS); tot[is.na(tot)] <- 0
+  cnt <- setNames(as.integer(table(f)), REGION_LEVELS)
+  ven <- setNames(as.integer(tapply(d$vendor, f, function(v) length(unique(v)))), REGION_LEVELS); ven[is.na(ven)] <- 0L
+  show <- REGION_LEVELS[REGION_LEVELS %in% REGIONS | cnt > 0]            # "Unassigned" only when it has quotes
+  all <- sum(tot); bar <- show[tot[show] > 0]
+  div(class = "rstrip",
+    div(class = "rstrip-top", span(class = "kpi-l", style = "margin:0", "Quoted by region"),
+        span(class = "card-sub", "Click a region to filter")),
+    div(class = "mix", style = "height:8px",
+        lapply(bar, function(k) span(style = sprintf("width:%.3f%%;background:%s", 100 * tot[[k]] / all, region_color(k)),
+                                     title = sprintf("%s: %s (%.0f%%)", k, fmt_money(tot[[k]]), 100 * tot[[k]] / all)))),
+    div(class = "rcells", lapply(show, function(k) tags$button(type = "button",
+        class = paste("rcell", if (k %in% sel) "on", if (!cnt[[k]]) "zero"), style = sprintf("--c:%s", region_color(k)),
+        onclick = js_set("region_pick", k),
+        div(class = "rc-n", tags$i(), k),
+        div(class = "rc-v", if (cnt[[k]]) fmt_compact(tot[[k]]) else "\u2014"),
+        div(class = "rc-s", if (cnt[[k]]) sprintf("%d quote%s \u00b7 %d vendor%s", cnt[[k]], if (cnt[[k]] == 1) "" else "s",
+                                                  ven[[k]], if (ven[[k]] == 1) "" else "s") else "No quotes yet")))))
+}
 
 mix_bar <- function(mix, h = 10) {
   tot <- sum(mix)
@@ -356,6 +400,66 @@ table.dataTable tbody tr { cursor:pointer; }
 .nav-underline .nav-link { font-weight:700; font-size:.86rem; }
 .modal-content { border-radius:1rem; border:0; }
 .shiny-notification { border-radius:.7rem; border:0; box-shadow:0 10px 30px rgba(15,23,42,.18); font-weight:600; }
+
+/* regions: one colour per region (--c), same chip on every tab */
+.region-chip { display:inline-flex; align-items:center; gap:.3rem; font-size:.64rem; font-weight:800; letter-spacing:.06em; padding:.1rem .45rem; border-radius:6px; white-space:nowrap; vertical-align:1px;
+  color:color-mix(in srgb, var(--c) 68%, #000); background:color-mix(in srgb, var(--c) 15%, #fff); }
+.region-chip::before { content:''; width:6px; height:6px; border-radius:50%; background:var(--c); }
+.rstrip { background:#fff; border:1px solid var(--line); border-radius:.85rem; padding:.85rem 1.1rem .8rem; margin-top:1rem; }
+.rstrip-top { display:flex; justify-content:space-between; align-items:baseline; gap:1rem; margin-bottom:.55rem; }
+.rcells { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:.55rem; margin-top:.7rem; }
+.rcell { text-align:left; background:#fff; border:1px solid var(--line); border-radius:.7rem; padding:.55rem .75rem; cursor:pointer; transition:border-color .15s, box-shadow .15s; color:var(--ink); }
+.rcell:hover { border-color:var(--c); }
+.rcell.on { border-color:var(--c); box-shadow:0 0 0 3px color-mix(in srgb, var(--c) 20%, #fff); }
+.rcell.zero .rc-v, .rcell.zero .rc-s { color:#b6bfcd; }
+.rc-n { display:flex; align-items:center; gap:.4rem; font-size:.66rem; font-weight:800; letter-spacing:.08em; color:var(--muted); }
+.rc-n i { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--c); }
+.rc-v { font-weight:800; font-size:1.08rem; letter-spacing:-.02em; margin-top:.1rem; }
+.rc-s { font-size:.72rem; color:#94a3b8; font-weight:600; }
+.card-header .shiny-input-container { margin-bottom:0; }
+.card-header .form-select { font-size:.8rem; font-weight:600; padding-top:.25rem; padding-bottom:.25rem; }
+.ib-tab .rdot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--c); margin-right:.35rem; }
+.ext-chip { display:inline-block; font-size:.66rem; font-weight:800; letter-spacing:.05em; text-transform:uppercase; padding:.1rem .45rem; border-radius:6px; background:#eef1f6; color:#475569; }
+.doc-a { font-weight:700; color:var(--ink); text-decoration:none; word-break:break-word; } .doc-a:hover { color:var(--blue); }
+table.dataTable.doc-dt tbody tr { cursor:default; }
+.dataTables_filter input { border:1px solid #dfe3eb; border-radius:.55rem; padding:.35rem .7rem; min-width:280px; font-size:.86rem; }
+.dataTables_filter input:focus { outline:0; border-color:var(--blue); box-shadow:0 0 0 3px rgba(38,115,252,.14); }
+
+/* map */
+.map-card > .card-body { padding:0; position:relative; }
+.map-card .leaflet-container { border-radius:0 0 .85rem .85rem; font-family:inherit; background:#e9eef5; }
+.map-empty { position:absolute; inset:0; z-index:500; display:grid; place-items:center; pointer-events:none; }
+.map-empty > div { pointer-events:auto; background:rgba(255,255,255,.95); border:1px solid var(--line); border-radius:.9rem; padding:1.2rem 1.5rem; text-align:center; max-width:360px; box-shadow:0 12px 32px rgba(15,23,42,.12); }
+.map-empty h6 { font-weight:800; letter-spacing:-.01em; margin-bottom:.3rem; } .map-empty p { color:var(--muted); font-size:.84rem; margin:0; }
+.map-legend { display:flex; gap:.9rem; flex-wrap:wrap; align-items:center; font-size:.74rem; font-weight:700; color:#475569; }
+.map-legend i { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:.35rem; box-shadow:0 0 0 2px #fff, 0 0 0 3px #e6e9f0; }
+.map-legend .n { color:#94a3b8; margin-left:.25rem; }
+.leaflet-popup-content-wrapper { border-radius:.85rem; box-shadow:0 14px 36px rgba(15,23,42,.2); }
+.leaflet-popup-content { margin:.9rem 1rem; min-width:230px; font-size:.84rem; }
+.mpop-t { font-weight:800; font-size:1rem; letter-spacing:-.01em; line-height:1.25; }
+.mpop-s { color:var(--muted); font-size:.78rem; margin-top:.3rem; }
+.mpop-g { display:grid; grid-template-columns:1fr 1fr; gap:.4rem; background:#f8f9fc; border-radius:.6rem; padding:.5rem .65rem; margin:.6rem 0; }
+.mpop-g span { display:block; font-size:.6rem; text-transform:uppercase; letter-spacing:.07em; color:#94a3b8; font-weight:800; }
+.mpop-g b { font-size:.98rem; letter-spacing:-.01em; }
+.mpop-v { font-size:.76rem; color:#475569; margin-bottom:.65rem; line-height:1.4; }
+.site-row { display:flex; justify-content:space-between; align-items:center; gap:.6rem; padding:.55rem .1rem; border-top:1px solid #f1f3f8; cursor:pointer; }
+.site-row:first-child { border-top:0; }
+.site-row:hover b { color:var(--blue); }
+.site-row b { font-weight:700; font-size:.88rem; word-break:break-word; } .site-row .sub { color:var(--muted); font-size:.74rem; }
+.approx { font-size:.62rem; font-weight:800; color:#8a6400; background:#fff6d9; border-radius:5px; padding:.08rem .4rem; }
+.map-legend i.ring { width:11px; height:11px; background:#fff; border:2px solid #0f172a; box-shadow:none; vertical-align:-1px; }
+.map-legend .sep { width:1px; height:14px; background:#e6e9f0; }
+.map-empty .btn { margin-top:.95rem; }
+.leaflet-control-layers { border:1px solid var(--line); border-radius:.7rem; box-shadow:0 6px 18px rgba(15,23,42,.12); font-family:inherit; font-size:.78rem; font-weight:600; color:#334155; }
+.leaflet-control-layers-expanded { padding:.5rem .75rem; }
+.leaflet-control-layers label { margin:0; }
+.mpop-tag { display:inline-block; font-size:.62rem; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:#334155; background:#eef1f6; border-radius:5px; padding:.08rem .4rem; margin-right:.25rem; }
+.mpop-vl { display:flex; flex-direction:column; gap:.2rem; font-size:.78rem; margin:.1rem 0 .7rem; max-height:150px; overflow:auto; }
+.mpop-vl > div { display:flex; justify-content:space-between; gap:.8rem; } .mpop-vl b { font-weight:700; } .mpop-vl span { color:#94a3b8; white-space:nowrap; }
+.geo-n { background:#eef1f6; color:#475569; border-radius:6px; padding:.02rem .4rem; font-size:.7rem; font-weight:700; margin-left:.4rem; }
+.map-note { display:flex; gap:.55rem; align-items:flex-start; color:var(--muted); font-size:.78rem; line-height:1.4; margin-top:.8rem; padding-top:.8rem; border-top:1px solid #f1f3f8; }
+.map-note > i { margin-top:.15rem; color:#94a3b8; flex:none; }
+.site-row .hint { color:#94a3b8; font-size:.72rem; }
 "
 
 # =============================================================================
@@ -385,8 +489,9 @@ ui_for <- function(user, ticket) do.call(page_navbar, c(list(
             actionButton("go_add", "Add quote", icon = icon("plus"), class = "btn-primary"))),
       uiOutput("kpis"),
       div(class = "filters",
-        layout_columns(col_widths = c(4, 2, 2, 2, 2),
+        layout_columns(col_widths = c(2, 2, 2, 2, 2, 2),
           textInput("f_text", "Search", placeholder = "Project, vendor, site, quote #…"),
+          selectizeInput("f_region", "Region", choices = REGION_LEVELS, multiple = TRUE, options = list(placeholder = "All regions")),
           selectizeInput("f_trade", "Trade", choices = NULL, multiple = TRUE, options = list(placeholder = "All trades")),
           selectizeInput("f_vendor", "Vendor", choices = NULL, multiple = TRUE, options = list(placeholder = "All vendors")),
           selectizeInput("f_status", "Status", choices = c(STATUSES, "Expired"), multiple = TRUE, options = list(placeholder = "Any status")),
@@ -406,20 +511,58 @@ ui_for <- function(user, ticket) do.call(page_navbar, c(list(
                                                               options = list(placeholder = "Pick a quote…")))),
       uiOutput("detail_body"))),
 
+  nav_panel("Map", value = "map", icon = icon("earth-americas"),
+    div(class = "wrap",
+      div(class = "page-h",
+        div(h3("Sites by region"), p("One marker per site, coloured by region and sized by total quoted; rings are vendor headquarters. Click a marker for details.")),
+        div(class = "d-flex gap-2 flex-wrap align-items-center", style = "min-width:min(540px,100%)",
+            div(style = "flex:1 1 220px", selectizeInput("m_region", NULL, choices = REGION_LEVELS, multiple = TRUE, width = "100%",
+                                                       options = list(placeholder = "All regions"))),
+            actionButton("m_zoom", "Zoom to region", icon = icon("magnifying-glass-location"), class = "btn-light"),
+            actionButton("m_fit", "Fit all", icon = icon("expand"), class = "btn-light"),
+            actionButton("m_geoall", tagList(icon("location-crosshairs"), "Look up all missing", uiOutput("m_geo_n", inline = TRUE)),
+                         class = "btn-light",
+                         title = "Place sites and vendor headquarters that have no location yet, from their city and country"))),
+      layout_columns(col_widths = c(8, 4), class = "align-items-start",
+        card(class = "map-card",
+          card_header(class = "d-flex justify-content-between align-items-center flex-wrap gap-2",
+                      span(class = "card-t", "Site map"), uiOutput("map_legend", inline = TRUE)),
+          card_body(if (HAS_LEAFLET) tagList(leaflet::leafletOutput("site_map", height = "640px"), uiOutput("map_empty"))
+                    else empty_state("The map needs the leaflet package",
+                                     "In R run install.packages(\"leaflet\") and restart the app. Everything else works without it."))),
+        div(uiOutput("map_needs"), uiOutput("map_editor"))))),
+
   nav_panel("Benchmarks", value = "bench", icon = icon("chart-simple"),
     div(class = "wrap",
       div(class = "page-h",
         div(h3("Benchmarks"), p("How vendors price the same kind of work — hourly rates, effective labor cost and fee per kW.")),
-        div(style = "min-width:min(320px,100%)", selectizeInput("b_trade", NULL, choices = NULL, multiple = TRUE, width = "100%",
-                                                              options = list(placeholder = "All trades")))),
+        div(class = "d-flex gap-2 flex-wrap", style = "min-width:min(540px,100%)",
+            div(style = "flex:1 1 200px", selectizeInput("b_region", NULL, choices = REGION_LEVELS, multiple = TRUE, width = "100%",
+                                                       options = list(placeholder = "All regions"))),
+            div(style = "flex:1 1 220px", selectizeInput("b_trade", NULL, choices = NULL, multiple = TRUE, width = "100%",
+                                                              options = list(placeholder = "All trades"))))),
       uiOutput("bench_body"))),
 
   nav_panel("Vendors", value = "vendors", icon = icon("building"),
     div(class = "wrap",
       div(class = "page-h",
         div(h3("Trade vendors"), p("Who we get service quotes from and how they've priced.")),
-        div(style = "min-width:min(300px,100%)", textInput("v_search", NULL, placeholder = "Search vendors…", width = "100%"))),
+        div(class = "d-flex gap-2 flex-wrap", style = "min-width:min(540px,100%)",
+            div(style = "flex:1 1 200px", selectizeInput("v_region", NULL, choices = REGION_LEVELS, multiple = TRUE, width = "100%",
+                                                       options = list(placeholder = "All regions"))),
+            div(style = "flex:1 1 220px", textInput("v_search", NULL, placeholder = "Search vendors…", width = "100%")))),
       uiOutput("vendor_cards"))),
+
+  nav_panel("Documents", value = "docs", icon = icon("folder-tree"),
+    div(class = "wrap",
+      div(class = "page-h",
+        div(h3("All documents"), p("Every file under the SharePoint root, by name and location. Nothing here is downloaded \u2014 open a file in SharePoint to read it.")),
+        div(class = "d-flex gap-2 flex-wrap", style = "min-width:min(540px,100%)",
+            div(style = "flex:1 1 200px", selectizeInput("doc_region", NULL, choices = REGION_LEVELS, multiple = TRUE, width = "100%",
+                                                       options = list(placeholder = "All regions"))),
+            div(style = "flex:1 1 220px", selectizeInput("doc_ext", NULL, choices = NULL, multiple = TRUE, width = "100%",
+                                                       options = list(placeholder = "All file types"))))),
+      uiOutput("docs_body"))),
 
   nav_panel(tagList("Add quote", uiOutput("inbox_badge", inline = TRUE)), value = "add", icon = icon("cloud-arrow-up"),
     div(class = "wrap",
@@ -477,7 +620,7 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "b_trade", choices = trades, selected = keep("b_trade"))
     updateSelectizeInput(session, "f_vendor", choices = sort(unique(d$vendor)), selected = keep("f_vendor"))
     locs <- if (nrow(d)) unlist(strsplit(na.omit(d$locations), ";\\s*")) else character()
-    sites <- sort(unique(na.omit(c(d$site_operator, d$site_code, locs, d$city))))
+    sites <- sort(unique(na.omit(c(d$site_operator, d$site_code, d$site_key, locs, d$city))))   # site_key: what the map jumps with
     updateSelectizeInput(session, "f_site", choices = sites, selected = keep("f_site"))
     labs <- if (nrow(d)) setNames(d$quote_id, paste0(d$vendor, " — ", nna(d$project_name, "Untitled"),
                                                      " (#", nna(d$proposal_no, "n/a"), ")")) else character()
@@ -491,14 +634,16 @@ server <- function(input, output, session) {
     t <- tolower(trimws(input$f_text %||% ""))
     if (nzchar(t)) {
       hay <- tolower(paste(d$vendor, d$project_name, d$proposal_no, d$site_operator, d$site_code, d$locations,
-                           d$city, d$state, d$data_hall, d$trade, d$client_contact, d$scope_summary))
+                           d$city, d$state, d$data_hall, d$trade, d$client_contact, d$scope_summary,
+                           d$region, d$subregion, d$country, d$project_folder))
       keep <- keep & grepl(t, hay, fixed = TRUE)
     }
+    if (length(input$f_region)) keep <- keep & d$region %in% input$f_region
     if (length(input$f_trade))  keep <- keep & d$trade %in% input$f_trade
     if (length(input$f_vendor)) keep <- keep & d$vendor %in% input$f_vendor
     if (length(input$f_status)) keep <- keep & d$status_eff %in% input$f_status
     if (length(input$f_site)) {
-      hit <- vapply(seq_len(nrow(d)), function(i) any(input$f_site %in% c(d$site_operator[i], d$site_code[i], d$city[i],
+      hit <- vapply(seq_len(nrow(d)), function(i) any(input$f_site %in% c(d$site_operator[i], d$site_code[i], d$site_key[i], d$city[i],
                                                                      strsplit(nna(d$locations[i]), ";\\s*")[[1]])), TRUE)
       keep <- keep & hit
     }
@@ -511,7 +656,7 @@ server <- function(input, output, session) {
     mix <- sum_mixes(lapply(d$quote_id, function(id) mix_of(d, id)))
     open_ <- d[d$status_eff %in% c("Received", "Under review"), , drop = FALSE]
     top <- if (length(mix)) names(mix)[which.max(mix)] else NULL
-    layout_columns(col_widths = c(3, 3, 3, 3),
+    tagList(layout_columns(col_widths = c(3, 3, 3, 3),
       kpi_tile(BRAND$red, "Quotes on file", nrow(d),
                sprintf("%d vendors · %d trades", length(unique(d$vendor)), length(unique(na.omit(d$trade))))),
       kpi_tile(BRAND$yellow, "Total quoted", fmt_compact(sum(d$base_total, na.rm = TRUE)),
@@ -521,7 +666,12 @@ server <- function(input, output, session) {
                if (length(mix) > 1) paste(names(mix)[-which.max(mix)], collapse = " · ") else NULL,
                extra = mix_bar(mix, 8)),
       kpi_tile(BRAND$blue, "Open quotes", nrow(open_),
-               sprintf("%d expire within 7 days", sum(!is.na(open_$days_left) & open_$days_left >= 0 & open_$days_left <= 7))))
+               sprintf("%d expire within 7 days", sum(!is.na(open_$days_left) & open_$days_left >= 0 & open_$days_left <= 7)))),
+      region_strip(d, input$f_region))
+  })
+  observeEvent(input$region_pick, {             # clicking a region cell toggles it in the Region filter
+    cur <- input$f_region %||% character(); k <- input$region_pick
+    updateSelectizeInput(session, "f_region", selected = if (k %in% cur) setdiff(cur, k) else c(cur, k))
   })
 
   # Quotes table ---------------------------------------------------------------------------------
@@ -537,8 +687,8 @@ server <- function(input, output, session) {
     tbl <- data.frame(
       Vendor  = vapply(seq_len(nrow(d)), function(i) as.character(div(class = "vcell", avatar(d$vendor[i], d$trade[i], 34),
                   div(tags$b(d$vendor[i]), div(class = "sub", nna(d$trade[i], "Trade not set"))))), ""),
-      Project = sprintf("<div style='max-width:300px'><span style='font-weight:600'>%s</span><div class='text-muted small'>#%s · %s</div></div>",
-                        htmlEscape(nna(d$project_name, "Untitled")), htmlEscape(nna(d$proposal_no, "n/a")), htmlEscape(nna(d$where, "—"))),
+      Project = sprintf("<div style='max-width:300px'><span style='font-weight:600'>%s</span><div class='text-muted small'>%s #%s · %s</div></div>",
+                        htmlEscape(nna(d$project_name, "Untitled")), region_chip_html(d$region), htmlEscape(nna(d$proposal_no, "n/a")), htmlEscape(nna(d$where, "—"))),
       Mix     = vapply(d$quote_id, function(id) as.character(div(style = "min-width:90px", mix_bar(mix_of(d, id), 8))), ""),
       Total   = d$base_total,
       Unit    = km,
@@ -583,6 +733,7 @@ server <- function(input, output, session) {
       div(class = "facts",
           fact(km$l, km$v), fact("Where", nna(r$where, "—")),
           fact("Quote date", fmt_date(r$quote_date)), fact("Validity", expiry_pill(r$days_left)),
+          fact("Region", region_chip(r$region)), fact("Site", or_dash(r$site_code)),
           fact("Scope items", r$n_scope), fact("Exclusions", r$n_excl)),
       section_title(sprintf("Fee lines (%d)", nrow(base))),
       lapply(head(seq_len(nrow(base)), 6), function(i) div(class = "line-mini",
@@ -603,7 +754,8 @@ server <- function(input, output, session) {
     filename = function() paste0("service_quotes_", Sys.Date(), ".csv"),
     content = function(file) {
       d <- filtered()
-      cols <- intersect(c("vendor", "trade", "proposal_no", "quote_date", "status_eff", "project_name", "site_operator",
+      cols <- intersect(c("vendor", "trade", "proposal_no", "quote_date", "status_eff", "project_name", "region", "subregion", "country",
+                          "project_folder", "site_operator",
                           "site_code", "locations", "city", "state", "it_load_kw", "labor_hours", "base_total",
                           "reimbursables", "fee_per_kw", "blended_rate", "fee_basis", "expires_on"), names(d))
       write.csv(d[, cols, drop = FALSE], file, row.names = FALSE, na = "")
@@ -634,6 +786,8 @@ server <- function(input, output, session) {
                                      div(style = "text-align:left;text-transform:none;letter-spacing:0;color:#0f172a;font-size:.82rem",
                                          s$vendor[i], div(class = "text-muted small", paste0("#", nna(s$proposal_no[i], "n/a"))))))))),
         tags$tbody(
+          tags$tr(tags$td(tags$b("Region")), lapply(seq_along(ids), function(i)
+            tags$td(class = "num", region_chip(s$region[i]), div(class = "text-muted small", nna(s$where[i], ""))))),
           row("Total", s$base_total, fmt_money),
           row("Reimbursables", s$reimbursables, fmt_money),
           row("Fee per kW", s$fee_per_kw, fmt_money),
@@ -754,6 +908,7 @@ server <- function(input, output, session) {
                 span("Quote ", tags$b(paste0("#", nna(r$proposal_no, "n/a")))),
                 span("Dated ", tags$b(fmt_date(r$quote_date))),
                 if (nzchar(nna(r$where))) span(icon("location-dot"), " ", tags$b(r$where)),
+                span(region_chip(r$region)),
                 if (!is.na(r$client_contact)) span("Attn ", tags$b(r$client_contact)),
                 if (!is.na(r$sp_web_url)) tags$a(href = r$sp_web_url, target = "_blank", style = "color:#9cc0ff;text-decoration:none",
                                                  icon("folder-open"), " Open in SharePoint"))),
@@ -795,6 +950,8 @@ server <- function(input, output, session) {
           layout_columns(col_widths = c(6, 6),
             div(section_title("Site & design basis"),
                 div(class = "facts",
+                    fact("Region", region_chip(r$region)),
+                    fact("Sub-region / country", or_dash(paste(na.omit(c(r$subregion, r$country)), collapse = " \u00b7 "))),
                     fact("Operator", or_dash(r$site_operator)), fact("Site code", or_dash(r$site_code)),
                     fact("Address", or_dash(paste(na.omit(c(r$address, r$city, r$state)), collapse = ", "))),
                     fact("Locations", or_dash(r$locations)),
@@ -816,7 +973,9 @@ server <- function(input, output, session) {
             div(class = "d-flex gap-2 mb-2", downloadButton("d_pdf", "Download original", class = "btn-light btn-sm"),
                 if (!is.na(r$sp_web_url)) tags$a(class = "btn btn-light btn-sm", href = r$sp_web_url, target = "_blank", icon("folder-open"), " Open in SharePoint"),
                 tags$a(class = "btn btn-light btn-sm", href = pdf_url, target = "_blank", icon("up-right-from-square"), " Open in new tab")),
-            tags$iframe(class = "pdf-frame", src = paste0(pdf_url, "#view=FitH")))
+            # Word originals can't be shown inline by a browser
+            if (grepl("\\.pdf$", r$source_file, ignore.case = TRUE)) tags$iframe(class = "pdf-frame", src = paste0(pdf_url, "#view=FitH"))
+            else empty_state("Word document", "Browsers can't show Word files inline \u2014 use Download original."))
           else empty_state("No original file", "This quote was entered by hand or its file was removed.")),
         nav_panel("Manage", icon = icon("gear"),
           div(class = "d-flex gap-2 align-items-center flex-wrap",
@@ -846,12 +1005,15 @@ server <- function(input, output, session) {
   bq <- reactive({
     d <- quotes()
     if (length(input$b_trade)) d <- keep_mix(d[d$trade %in% input$b_trade, , drop = FALSE], d)
+    if (length(input$b_region)) d <- keep_mix(d[d$region %in% input$b_region, , drop = FALSE], d)
     d
   })
   rates_data <- reactive({
     refresh()
-    r <- q_all("SELECT r.role_std, r.rate, v.name AS vendor, v.trade FROM rate_cards r JOIN vendors v ON v.vendor_id = r.vendor_id WHERE r.rate IS NOT NULL")
+    r <- q_all("SELECT r.role_std, r.rate, v.name AS vendor, v.trade, q.region FROM rate_cards r
+                JOIN vendors v ON v.vendor_id = r.vendor_id JOIN quotes q ON q.quote_id = r.quote_id WHERE r.rate IS NOT NULL")
     if (length(input$b_trade)) r <- r[r$trade %in% input$b_trade, , drop = FALSE]
+    if (length(input$b_region)) r <- r[norm_region(r$region) %in% input$b_region, , drop = FALSE]
     r
   })
   gg_theme <- function() theme_minimal(base_size = 12.5) + theme(
@@ -932,8 +1094,13 @@ server <- function(input, output, session) {
            SUM(CASE WHEN q.status = 'Awarded' THEN 1 ELSE 0 END) AS awarded
            FROM vendors v LEFT JOIN quotes q ON q.vendor_id = v.vendor_id GROUP BY v.vendor_id ORDER BY v.name")
   })
+  vendor_regions <- reactive({ refresh(); q_all("SELECT DISTINCT vendor_id, region FROM quotes") })
   output$vendor_cards <- renderUI({
     v <- vendors_df()
+    vr <- vendor_regions(); vr$region <- norm_region(vr$region)
+    vreg <- split(vr$region, vr$vendor_id)                         # regions each vendor has quoted in
+    if (length(input$v_region) && nrow(v))
+      v <- v[v$vendor_id %in% vr$vendor_id[vr$region %in% input$v_region], , drop = FALSE]
     t <- tolower(trimws(input$v_search %||% ""))
     if (nzchar(t) && nrow(v)) v <- v[grepl(t, tolower(paste(v$name, v$trade, v$contact, v$hq, v$email)), fixed = TRUE), , drop = FALSE]
     if (!nrow(v)) return(card(card_body(empty_state(if (nzchar(t)) "No vendors match" else "No vendors yet",
@@ -943,7 +1110,7 @@ server <- function(input, output, session) {
           avatar(v$name[i], v$trade[i], 46),
           div(class = "flex-grow-1", style = "min-width:0", h6(v$name[i]),
               div(class = "d-flex gap-2 align-items-center flex-wrap mt-1",
-                  trade_chip(v$trade[i]), if (!is.na(v$hq[i])) span(class = "hq", icon("location-dot"), " ", v$hq[i]))),
+                  trade_chip(v$trade[i]), lapply(unique(vreg[[as.character(v$vendor_id[i])]]), region_chip), if (!is.na(v$hq[i])) span(class = "hq", icon("location-dot"), " ", v$hq[i]))),
           tags$button(class = "btn btn-sm btn-light", title = "Edit vendor", type = "button",
                       onclick = sprintf("Shiny.setInputValue('vendor_edit', %d, {priority: 'event'})", as.integer(v$vendor_id[i])), icon("pen"))),
       div(class = "vstats",
@@ -978,7 +1145,17 @@ server <- function(input, output, session) {
                   blank_na(input$ve_phone), blank_na(input$ve_web), blank_na(input$ve_hq), blank_na(input$ve_notes),
                   session$userData$vendor_edit)); TRUE
     }, error = function(e) { showNotification(paste("Couldn't save:", conditionMessage(e)), type = "error"); FALSE })
-    if (ok) { removeModal(); showNotification("Vendor updated.", type = "message"); bump() }
+    if (ok) {
+      removeModal(); showNotification("Vendor updated.", type = "message"); bump()
+      # a new or changed headquarters is looked up straight away (the old point stops showing as soon as the text differs)
+      vid <- session$userData$vendor_edit
+      if (geocode_available() && nrow(vendors_missing(vid))) {
+        res <- tryCatch(withProgress(message = "Placing the headquarters on the map…", value = 0.4,
+                                     geocode_pending(site_codes = character(), vendor_ids = vid)),
+                        error = function(e) NULL)
+        if (!is.null(res)) { geo_report(res); bump() }
+      }
+    }
   })
 
   # Add / Import ------------------------------------------------------------------------------------------
@@ -1028,12 +1205,24 @@ server <- function(input, output, session) {
 
   # one entry point for "read this PDF and open the review screen" (upload or SharePoint)
   start_review <- function(path, name, sp = NULL, hints = list()) {
+    # a Word file from SharePoint may arrive as Graph's PDF rendition: name it .pdf so the browser shows it
+    if (is_pdf_file(path) && !grepl("\\.pdf$", name, ignore.case = TRUE)) name <- paste0(name, ".pdf")
     dest <- file.path(prev_dir, paste0(format(Sys.time(), "%H%M%S"), "_", gsub("[^A-Za-z0-9._-]+", "_", name)))
     file.copy(path, dest, overwrite = TRUE)
-    src(list(path = dest, name = name, url = paste0(basename(prev_dir), "/", basename(dest)), sp = sp))
+    url <- paste0(basename(prev_dir), "/", basename(dest))
+    if (!is_pdf_file(dest)) {
+      # Word upload: a browser can't display it, so show its text beside the form instead (NULL = no preview)
+      url <- tryCatch({
+        pv <- paste0(dest, ".preview.html")
+        writeLines(enc2utf8(c("<!doctype html><meta charset='utf-8'><pre style='font:13px/1.55 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;padding:14px;margin:0;color:#0f172a'>",
+                              htmlEscape(word_text(dest, file_ext_lower(name))), "</pre>")), pv, useBytes = TRUE)
+        paste0(basename(prev_dir), "/", basename(pv))
+      }, error = function(e) NULL)
+    }
+    src(list(path = dest, name = name, url = url, sp = sp))
     parse_err(NULL)
-    p <- withProgress(message = "Reading the quote…", value = 0.5,
-                      tryCatch(parse_service_quote(dest, file_name = name, hints = hints),
+    p <- withProgress(message = "Reading the quote\u2026", value = 0.5,
+                      tryCatch(parse_quote_file(dest, file_name = name, hints = hints),
                                error = function(e) { parse_err(conditionMessage(e)); NULL }))
     if (is.null(p)) p <- empty_parse()
     load_into_form(p)
@@ -1042,6 +1231,8 @@ server <- function(input, output, session) {
 
   # ---- SharePoint inbox ----------------------------------------------------------------------------
   inbox_v <- reactiveVal(0)
+  sites_v <- reactiveVal(0)                       # bumped when sites / coordinates change (Map tab)
+  ib_regions <- reactiveVal(character())          # region chips selected in the inbox
   inbox <- reactive({
     inbox_v(); refresh()
     q_all("SELECT * FROM sp_files ORDER BY CASE status WHEN 'updated' THEN 0 WHEN 'new' THEN 1 WHEN 'imported' THEN 2 ELSE 3 END,
@@ -1051,22 +1242,31 @@ server <- function(input, output, session) {
     n <- sum(inbox()$status %in% c("new", "updated"))
     if (n > 0) span(class = "nav-badge", n)
   })
-  do_scan <- function() {
-    withProgress(message = "Checking SharePoint…", value = 0.05, {
-      res <- tryCatch(sp_sync(function(m) incProgress(0.03, detail = m)), error = function(e) e)
+  # region = NULL scans everything; a region name scans just that branch (keeps a first scan short)
+  do_scan <- function(region = NULL) {
+    withProgress(message = if (is.null(region)) "Checking SharePoint\u2026" else paste0("Checking SharePoint (", region, ")\u2026"), value = 0.05, {
+      res <- tryCatch(sp_sync(function(m) incProgress(0.02, detail = m), region = region), error = function(e) e)
     })
     if (inherits(res, "error")) {
       showNotification(paste("SharePoint scan failed:", conditionMessage(res)), type = "error", duration = 15)
     } else {
-      showNotification(sprintf("SharePoint: %d quote PDFs · %d new · %d changed", res$found, res$new, res$changed), type = "message")
+      showNotification(sprintf("SharePoint: %d quote files \u00b7 %d new \u00b7 %d changed \u00b7 %d read%s%s",
+                               res$found, res$new, res$changed, res$read,
+                               if (res$skipped > 0) sprintf(" \u00b7 %d set aside as not-quotes", res$skipped) else "",
+                               if (res$pending > 0) sprintf(" \u00b7 %d still to read \u2014 scan again to continue", res$pending) else ""),
+                       type = "message", duration = 8)
+      # depth limit reached / folders that couldn't be listed: stays on screen until dismissed
+      for (w in res$warnings) showNotification(w, type = "warning", duration = NULL)
     }
-    inbox_v(inbox_v() + 1); bump()
+    inbox_v(inbox_v() + 1); sites_v(sites_v() + 1); bump()
   }
-  observeEvent(input$sp_scan, do_scan())
+  observeEvent(input$sp_scan, { reg <- input$sp_scan_region %||% ""; do_scan(if (nzchar(reg)) reg else NULL) })
   observeEvent(input$nav, {
+    # automatic re-scan only once a first scan exists: the first one can be long, so it is started on purpose
+    # (Rscript tools/sp_first_scan.R, or pick a region and press Scan now)
     if (identical(input$nav, "add") && sp_configured() && stage() == "upload") {
       last <- sp_last_scan()
-      if (is.na(last) || as.numeric(difftime(Sys.time(), last, units = "mins")) > SP_CONF()$auto_min) do_scan()
+      if (!is.na(last) && as.numeric(difftime(Sys.time(), last, units = "mins")) > SP_CONF()$auto_min) do_scan()
     }
   }, ignoreInit = TRUE)
   observeEvent(input$ib_filter, inbox_v(inbox_v() + 1))
@@ -1079,14 +1279,26 @@ server <- function(input, output, session) {
     r <- q_all("SELECT * FROM sp_files WHERE item_id = ?", list(input$ib_review)); req(nrow(r))
     path <- r$local_path
     if (is.na(path) || !file.exists(path)) {
-      path <- tryCatch(sp_download(r$item_id, file.path(FILES_DIR, "inbox", paste0(gsub("[^A-Za-z0-9]", "", r$item_id), ".pdf"))),
+      path <- tryCatch(sp_fetch_file(r),
                        error = function(e) { showNotification(paste("Couldn't download from SharePoint:", conditionMessage(e)), type = "error", duration = 12); NULL })
       if (is.null(path)) return()
     }
     hints <- folder_hints(r$folder)
     start_review(path, r$name, hints = hints,
                  sp = list(item_id = r$item_id, web_url = r$web_url, folder = r$folder, project_folder = hints$project_folder,
-                           uploaded_by = r$uploaded_by, status = r$status))
+                           uploaded_by = r$uploaded_by, status = r$status, loc = hints$loc))
+  })
+  # "Read anyway" on a file that was set aside by its name (PO, invoice, change order, scope document)
+  observeEvent(input$ib_force, {
+    r <- q_all("SELECT * FROM sp_files WHERE item_id = ?", list(input$ib_force)); req(nrow(r))
+    q_exec("UPDATE sp_files SET status = 'new', doc_kind = 'quote' WHERE item_id = ?", list(r$item_id))
+    r$status <- "new"
+    withProgress(message = "Reading from SharePoint\u2026", value = 0.5, tryCatch(sp_preview_one(r), error = function(e) NULL))
+    inbox_v(inbox_v() + 1)
+  })
+  observeEvent(input$ib_region_pick, {
+    cur <- ib_regions(); k <- input$ib_region_pick
+    ib_regions(if (k %in% cur) setdiff(cur, k) else c(cur, k))
   })
 
   output$inbox_card <- renderUI({
@@ -1100,8 +1312,13 @@ server <- function(input, output, session) {
               tags$li("Add ", tags$code("SP_TENANT_ID"), ", ", tags$code("SP_CLIENT_ID"), ", ", tags$code("SP_CLIENT_SECRET"), " to ", tags$code(".Renviron"), " next to app.R."),
               tags$li("Install ", tags$code("httr2"), " and restart the app.")))))))
     f <- inbox(); flt <- input$ib_filter %||% "todo"
-    groups <- list(todo = c("new", "updated"), imported = "imported", ignored = "ignored", all = c("new", "updated", "imported", "ignored"))
-    labels <- c(todo = "To review", imported = "Imported", ignored = "Ignored", all = "All")
+    f$region <- norm_region(f$region); rsel <- ib_regions()
+    rcount <- setNames(as.integer(table(factor(f$region, REGION_LEVELS))), REGION_LEVELS)
+    if (length(rsel)) f <- f[f$region %in% rsel, , drop = FALSE]
+    # "aside" = found in a quote folder but named like a PO / invoice / change order / scope document: not downloaded
+    groups <- list(todo = c("new", "updated"), imported = "imported", aside = "skipped", ignored = "ignored",
+                   all = c("new", "updated", "imported", "skipped", "ignored"))
+    labels <- c(todo = "To review", imported = "Imported", aside = "Set aside", ignored = "Ignored", all = "All")
     n <- vapply(groups, function(g) sum(f$status %in% g), 0)
     rows <- f[f$status %in% groups[[flt]], , drop = FALSE]
     last <- sp_last_scan()
@@ -1110,14 +1327,17 @@ server <- function(input, output, session) {
                                    onclick = sprintf("Shiny.setInputValue('ib_filter', '%s', {priority: 'event'})", k),
                                    labels[[k]], span(class = "c", n[[k]]))
     js <- function(id, v) sprintf("Shiny.setInputValue('%s', %s, {priority: 'event'})", id, jsonlite::toJSON(v, auto_unbox = TRUE))
+    rtab <- function(k) tags$button(type = "button", class = paste("ib-tab", if (k %in% rsel) "on"), style = sprintf("--c:%s", region_color(k)),
+                                    onclick = js("ib_region_pick", k), span(class = "rdot"), k, span(class = "c", rcount[[k]]))
     row_ui <- function(r) {
       pillk <- switch(r$status, new = pill("New", "info"), updated = pill("Changed in SharePoint", "warn"),
-                      imported = pill("Imported", "ok"), ignored = pill("Ignored", "muted"))
+                      imported = pill("Imported", "ok"), ignored = pill("Ignored", "muted"),
+                      skipped = pill(kind_label(r$doc_kind), "muted"), pill(r$status, "muted"))
       div(class = "ib-row",
-        div(class = "ib-ic", icon("file-pdf")),
+        div(class = "ib-ic", icon(if (identical(file_ext_lower(r$name), "pdf")) "file-pdf" else "file-word")),
         div(style = "min-width:0",
           div(class = "ib-name", tags$a(href = r$web_url, target = "_blank", title = "Open in SharePoint", r$name)),
-          div(class = "ib-crumbs", lapply(folder_crumbs(r$folder), span)),
+          div(class = "ib-crumbs", region_chip(r$region), " ", lapply(folder_crumbs(r$folder), span)),
           div(class = "ib-meta", paste(c(if (!is.na(r$uploaded_by)) paste("Added by", r$uploaded_by),
                                          if (!is.na(r$modified)) paste("updated", fmt_date(substr(r$modified, 1, 10)))), collapse = " · ")),
           if (!is.na(r$parse_note) && r$status %in% c("new", "updated")) div(class = "ib-note", icon("triangle-exclamation"), " ", substr(r$parse_note, 1, 160))),
@@ -1126,23 +1346,33 @@ server <- function(input, output, session) {
             div(style = "min-width:0", tags$b(r$vendor_guess),
                 div(class = "sub", paste(c(if (!is.na(r$trade_guess)) r$trade_guess, if (!is.na(r$quote_no_guess)) paste0("#", r$quote_no_guess)), collapse = " · "))))
           else span(class = "text-muted small", if (is.na(r$etag_parsed)) "Not read yet" else "Vendor not recognized"),
-          if (!is.na(r$total_guess)) div(class = "tot mt-1", fmt_money(r$total_guess))),
+          if (!is.na(r$total_guess)) div(class = "tot mt-1", fmt_money(r$total_guess))
+          else if (!is.na(r$etag_parsed) && r$status %in% c("new", "updated")) div(class = "mt-1", pill("No price found \u2014 probably not a quote", "warn"))),
         div(class = "ib-act", pillk,
           if (r$status %in% c("new", "updated")) tagList(
             tags$button(type = "button", class = "btn btn-primary btn-sm", onclick = js("ib_review", r$item_id), icon("magnifying-glass"), " Review"),
             tags$button(type = "button", class = "btn btn-light btn-sm", title = "Not a quote / don't import", onclick = js("ib_ignore", r$item_id), icon("eye-slash")))
+          else if (r$status == "skipped") tags$button(type = "button", class = "btn btn-light btn-sm", title = "Download and read it as a quote",
+                                                      onclick = js("ib_force", r$item_id), "Read anyway")
           else if (r$status == "imported") tags$button(type = "button", class = "btn btn-light btn-sm", onclick = js("ib_open", r$item_id), "View quote")
           else tags$button(type = "button", class = "btn btn-light btn-sm", onclick = js("ib_restore", r$item_id), "Restore")))
     }
     card(class = "mb-3",
       card_header(class = "d-flex justify-content-between align-items-center flex-wrap gap-2",
         div(span(class = "card-t", icon("folder-open"), " SharePoint inbox"),
-            div(class = "card-sub", sprintf("%s › %s · PDFs in “… Partners” folders", cf$site, cf$root))),
-        div(class = "d-flex align-items-center gap-2",
+            div(class = "card-sub", sprintf("%s \u203a %s \u00b7 PDF and Word files in quote folders, at any depth", cf$site, cf$root))),
+        div(class = "d-flex align-items-center gap-2 flex-wrap",
             span(class = "card-sub", if (is.na(last)) "Not scanned yet" else paste("Last checked", format(last, "%b %d, %H:%M", tz = Sys.timezone()))),
+            selectInput("sp_scan_region", NULL, c("All regions" = "", REGIONS), selected = isolate(input$sp_scan_region) %||% "",
+                        width = "132px", selectize = FALSE),
             actionButton("sp_scan", "Scan now", icon = icon("rotate"), class = "btn-light btn-sm"))),
       card_body(fillable = FALSE,
-        div(class = "ib-tabs", lapply(names(labels), tab)),
+        if (is.na(last)) div(class = "msg warn mb-3", icon("circle-info"),
+          span("First scan: run ", tags$code("Rscript tools/sp_first_scan.R"), " once from the app folder (it reads everything outside the app), ",
+               "or pick one region above and press Scan now.")),
+        div(class = "d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2",
+            div(class = "ib-tabs mb-0", lapply(names(labels), tab)),
+            div(class = "ib-tabs mb-0", lapply(REGION_LEVELS[REGION_LEVELS %in% REGIONS | rcount > 0], rtab))),
         if (!nrow(rows)) div(class = "text-muted small py-3 text-center",
                              if (flt == "todo") "Nothing waiting — new quotes saved to SharePoint will appear here." else "Nothing here.")
         else tagList(lapply(seq_len(min(nrow(rows), 50)), function(i) row_ui(rows[i, ])),
@@ -1160,8 +1390,8 @@ server <- function(input, output, session) {
         div(class = "drop",
             img(src = "bytebridge-mark.png", class = "drop-mark", alt = ""),
             h5("Drop a vendor quote here"),
-            div(class = "text-muted", "PDF proposals, fee letters and line-item quotes · up to 50 MB"),
-            fileInput("up_pdf", NULL, accept = c(".pdf", "application/pdf"), width = "100%",
+            div(class = "text-muted", "PDF or Word proposals, fee letters and line-item quotes · up to 50 MB"),
+            fileInput("up_pdf", NULL, accept = c(".pdf", "application/pdf", ".doc", ".docx", "application/msword"), width = "100%",
                       buttonLabel = "Choose PDF…", placeholder = "or drag it onto this box")),
         div(class = "d-flex align-items-center justify-content-center gap-2 mt-3",
             span(class = "text-muted small", "No PDF?"),
@@ -1181,6 +1411,9 @@ server <- function(input, output, session) {
     # ---- review ----
     p <- parsed(); v <- p$vendor; q <- p$quote; s <- src()
     g <- function(x, default = "") if (is.null(x) || length(x) == 0 || all(is.na(x))) default else x
+    loc <- s$sp$loc                               # region / location read from the SharePoint path (NULL for uploads)
+    reg0 <- if (!is.null(loc) && loc$region %in% REGIONS) loc$region
+            else if (nzchar(g(q$state)) && toupper(g(q$state)) %in% c(state.abb, toupper(state.name))) "AMER" else ""
     form <- tagList(
       uiOutput("parse_report"),
       card(card_header(span(class = "card-t", "Quote")), card_body(fillable = FALSE,
@@ -1212,6 +1445,10 @@ server <- function(input, output, session) {
           textInput("a_hall", "Data hall", g(q$data_hall))),
         layout_columns(col_widths = c(6, 3, 3),
           textInput("a_address", "Address", g(q$address)), textInput("a_city", "City", g(q$city)), textInput("a_state", "State", g(q$state))),
+        layout_columns(col_widths = c(4, 4, 4),
+          selectInput("a_region", "Region", c("Not set" = "", REGIONS), selected = reg0),
+          textInput("a_subregion", "Sub-region", g(loc$subregion)),
+          textInput("a_country", "Country", g(loc$country))),
         layout_columns(col_widths = c(6, 3, 3),
           textInput("a_locations", "Locations (multi-site, separate with ;)", g(q$locations)),
           numericInput("a_kw", "IT load (kW)", g(q$it_load_kw, NA)), numericInput("a_hours", "Labor hours", g(q$labor_hours, NA))),
@@ -1231,7 +1468,7 @@ server <- function(input, output, session) {
           actionButton("add_cancel", "Discard", class = "btn-light"),
           actionButton("add_save", "Save quote", icon = icon("check"), class = "btn-primary px-4")))
 
-    if (is.null(s)) return(form)
+    if (is.null(s) || is.null(s$url)) return(form)          # no file, or a file with nothing to preview
     layout_sidebar(fillable = FALSE, border = FALSE, fg = "#0f172a",
       sidebar = sidebar(position = "right", width = "38%", open = TRUE, bg = "#ffffff",
                         title = div(class = "d-flex justify-content-between align-items-center gap-2",
@@ -1302,15 +1539,400 @@ server <- function(input, output, session) {
               design_months = input$a_dmo, construction_months = input$a_cmo, fee_basis = input$a_basis,
               billing_terms = input$a_billing, base_total = input$a_total, reimbursables = input$a_reimb,
               doc_total = p$quote$doc_total, scope_summary = input$a_summary, layout = p$layout, notes = input$a_notes,
-              sp_item_id = s$sp$item_id, sp_web_url = s$sp$web_url, project_folder = s$sp$project_folder %||% p$project_folder)
+              sp_item_id = s$sp$item_id, sp_web_url = s$sp$web_url, project_folder = s$sp$project_folder %||% p$project_folder,
+              region = input$a_region, subregion = input$a_subregion, country = input$a_country,
+              # site key for the map: the site code on the form, else the project key from the SharePoint path
+              site_key = if (nzchar(trimws(input$a_site %||% ""))) trimws(input$a_site) else s$sp$loc$site_key,
+              site_name = s$sp$project_folder)
     qid <- tryCatch(save_quote(v, q, lines_rv(), rates_rv(), p$rate_year, scope_rv(), equip_rv(),
                                src_path = s$path, src_name = s$name),
                     error = function(e) { showNotification(paste("Save failed:", conditionMessage(e)), type = "error", duration = 12); NULL })
     if (is.null(qid)) return()
-    saved_id(qid); stage("done"); bump(); inbox_v(inbox_v() + 1)
+    saved_id(qid); stage("done"); bump(); inbox_v(inbox_v() + 1); sites_v(sites_v() + 1)
     showNotification(sprintf("Saved %s quote #%s", v$name, nna(input$a_prop, "")), type = "message")
+    # Put this quote's site and its vendor's headquarters on the map if they have no point yet. Blanks only: a
+    # location typed in by hand is never touched, and a failed look-up never blocks the save (it is already saved).
+    if (geocode_available()) {
+      res <- tryCatch(withProgress(message = "Placing this site and vendor on the map…", value = 0.3, geocode_for_quote(qid)),
+                      error = function(e) NULL)
+      if (!is.null(res) && nrow(res$out)) { geo_report(res); sites_v(sites_v() + 1); bump() }
+    }
   })
   observeEvent(input$view_saved, go_detail(saved_id()))
+
+  # All documents (metadata-only catalogue) -------------------------------------------------------------
+  docs_all <- reactive({
+    refresh(); inbox_v()
+    d <- q_all("SELECT * FROM sp_documents")
+    d$region <- norm_region(d$region)
+    d$ext[is.na(d$ext) | d$ext == ""] <- "(none)"
+    d
+  })
+  observe({
+    d <- docs_all(); tb <- sort(table(d$ext), decreasing = TRUE)
+    if (length(tb)) updateSelectizeInput(session, "doc_ext", selected = isolate(input$doc_ext),
+                                         choices = setNames(names(tb), sprintf("%s (%d)", names(tb), as.integer(tb))))
+  })
+  docs_f <- reactive({
+    d <- docs_all()
+    if (length(input$doc_region)) d <- d[d$region %in% input$doc_region, , drop = FALSE]
+    if (length(input$doc_ext))    d <- d[d$ext %in% input$doc_ext, , drop = FALSE]
+    d
+  })
+  output$docs_body <- renderUI({
+    if (!nrow(docs_all())) return(card(card_body(empty_state("No documents catalogued yet",
+      if (!sp_configured()) "Connect SharePoint first (see the Add quote tab)."
+      else if (!SP_CONF()$catalogue) "The catalogue is switched off (SP_CATALOGUE=false in .Renviron)."
+      else "Run a SharePoint scan and every file under the root is listed here with a link back to SharePoint."))))
+    d <- docs_f()
+    n_reg <- table(factor(d$region, REGION_LEVELS)); n_reg <- n_reg[n_reg > 0]
+    tagList(
+      layout_columns(col_widths = c(3, 3, 3, 3), class = "mb-3",
+        kpi_tile(BRAND$red, "Files", fmt_num(nrow(d)),
+                 if (length(n_reg)) paste(sprintf("%s %s", names(n_reg), fmt_num(as.integer(n_reg))), collapse = " · ") else NULL),
+        kpi_tile(BRAND$yellow, "Projects", length(unique(na.omit(d$project_folder))), "folders with at least one file"),
+        kpi_tile(BRAND$green, "PDFs", fmt_num(sum(d$ext == "pdf")),
+                 sprintf("%s Word · %s Excel", fmt_num(sum(d$ext %in% c("doc", "docx"))), fmt_num(sum(d$ext %in% c("xls", "xlsx", "xlsm"))))),
+        kpi_tile(BRAND$blue, "Total size", if (nrow(d)) sprintf("%.1f GB", sum(d$size, na.rm = TRUE) / 1024^3) else "—",
+                 "in SharePoint — nothing is copied here")),
+      card(card_header(class = "d-flex justify-content-between align-items-center flex-wrap gap-1",
+                       span(class = "card-t", "Files"),
+                       span(class = "card-sub", "Name, location and link only · search matches file, folder and project")),
+           card_body(DTOutput("docs_tbl"))))
+  })
+  output$docs_tbl <- renderDT({
+    d <- docs_f(); root <- SP_CONF()$root
+    relp <- ifelse(startsWith(nna(d$folder), paste0(root, "/")), substring(nna(d$folder), nchar(root) + 2), nna(d$folder))
+    relp <- gsub("/", " › ", relp, fixed = TRUE)
+    url <- htmlEscape(nna(d$web_url, "#"), attribute = TRUE)
+    tbl <- data.frame(
+      File = sprintf("<div style='max-width:460px'><a class='doc-a' href='%s' target='_blank' rel='noopener'>%s</a><div class='text-muted small'>%s</div></div>",
+                     url, htmlEscape(nna(d$name)), htmlEscape(relp)),
+      Type = sprintf("<span class='ext-chip'>%s</span>", htmlEscape(d$ext)),
+      Region = region_chip_html(d$region),
+      Project = htmlEscape(nna(d$project_folder, "—")),
+      Modified = as.Date(substr(nna(d$modified), 1, 10), format = "%Y-%m-%d"),
+      Size = round(d$size / 1024),
+      By = htmlEscape(nna(d$uploaded_by)),
+      Open = sprintf("<a class='btn btn-light btn-sm text-nowrap' href='%s' target='_blank' rel='noopener'>Open in SharePoint</a>", url),
+      stringsAsFactors = FALSE)
+    datatable(tbl, escape = FALSE, rownames = FALSE, selection = "none", class = "hover doc-dt",
+              colnames = c("File", "Type", "Region", "Project", "Modified", "Size (KB)", "Added by", ""),
+              options = list(pageLength = 25, dom = "ftip", order = list(list(4, "desc")),
+                             columnDefs = list(list(className = "dt-right", targets = 5), list(orderable = FALSE, targets = 7)),
+                             language = list(search = "", searchPlaceholder = "Search file, folder, project…",
+                                             emptyTable = "No files match these filters."))) |>
+      formatRound("Size", digits = 0) |>
+      formatDate("Modified", method = "toLocaleDateString", params = list("en-US", list(month = "short", day = "numeric", year = "numeric")))
+  })
+
+  # Map ---------------------------------------------------------------------------------------------------
+  # sites table + what has been quoted at each site
+  sites_all <- reactive({
+    refresh(); sites_v()
+    s <- load_sites(); d <- quotes()
+    if (!nrow(s)) { s$n_quotes <- integer(); s$quoted <- numeric(); s$vendors <- character(); return(s) }
+    s$n_quotes <- 0L; s$quoted <- 0; s$vendors <- ""
+    ok <- if (nrow(d)) !is.na(d$site_key) & nzchar(d$site_key) else logical()
+    if (any(ok)) {
+      k <- d$site_key[ok]
+      n <- table(k); tot <- tapply(na0(d$base_total[ok]), k, sum)
+      ven <- tapply(d$vendor[ok], k, function(v) paste(unique(v), collapse = ", "))
+      reg <- tapply(d$region[ok], k, function(r) r[1])
+      i <- match(s$site_code, names(n)); hit <- !is.na(i)
+      s$n_quotes[hit] <- as.integer(n)[i[hit]]
+      s$quoted[hit]   <- as.numeric(tot)[match(s$site_code[hit], names(tot))]
+      s$vendors[hit]  <- as.character(ven)[match(s$site_code[hit], names(ven))]
+      # a site typed in by hand has no region of its own: take it from its quotes
+      fill <- hit & s$region == "Unassigned"
+      s$region[fill] <- as.character(reg)[match(s$site_code[fill], names(reg))]
+    }
+    s
+  })
+  map_sites <- reactive({
+    s <- sites_all()
+    if (length(input$m_region)) s <- s[s$region %in% input$m_region, , drop = FALSE]
+    s
+  })
+  located <- function(s) s[!is.na(s$lat) & !is.na(s$lon), , drop = FALSE]
+
+  # Vendor headquarters that are on the map: one ring per place, however many vendors share it.
+  # Only points that still match the HQ text on file are drawn (see hq_fresh() in R/sites.R).
+  vendor_pins <- reactive({
+    v <- vendors_df()
+    if (!nrow(v)) return(NULL)
+    v <- v[hq_fresh(v), , drop = FALSE]
+    if (length(input$m_region) && nrow(v)) {           # same rule as the Vendors tab: vendors that have quoted in those regions
+      vr <- vendor_regions(); vr$region <- norm_region(vr$region)
+      v <- v[v$vendor_id %in% vr$vendor_id[vr$region %in% input$m_region], , drop = FALSE]
+    }
+    if (!nrow(v)) return(NULL)
+    v$place <- hq_text(v)
+    v$key <- paste(round(v$hq_lat, 2), round(v$hq_lon, 2))
+    g <- lapply(split(seq_len(nrow(v)), v$key), function(ix) {
+      p <- v[ix, , drop = FALSE]; p <- p[order(-na0(p$quoted), p$name), , drop = FALSE]
+      n <- nrow(p); shown <- head(p, 6)
+      rows <- sprintf("<div><b>%s</b><span>%s</span></div>", htmlEscape(shown$name), htmlEscape(nna(shown$trade)))
+      popup <- sprintf(paste0("<div class='mpop'><div class='mpop-t'>%s</div>",
+                              "<div class='mpop-s'><span class='mpop-tag'>Vendor HQ</span>%s</div>",
+                              "<div class='mpop-g'><div><span>%s</span><b>%d</b></div><div><span>Total quoted</span><b>%s</b></div></div>",
+                              "<div class='mpop-vl'>%s%s</div>",
+                              "<button type='button' class='btn btn-primary btn-sm w-100' data-hq='%s' ",
+                              "onclick=\"Shiny.setInputValue('map_goto_vendor', this.dataset.hq, {priority: 'event'})\">%s</button></div>"),
+                       htmlEscape(p$place[1]),
+                       if (all(p$hq_source %in% "geocoded")) "<span class='approx'>approximate</span>" else "",
+                       if (n == 1) "Vendor" else "Vendors", n, fmt_compact(sum(na0(p$quoted))),
+                       paste(rows, collapse = ""),
+                       if (n > 6) sprintf("<div><span>+ %d more</span></div>", n - 6) else "",
+                       htmlEscape(p$place[1], attribute = TRUE),
+                       if (n == 1) "View this vendor" else "View these vendors")
+      data.frame(lat = p$hq_lat[1], lon = p$hq_lon[1], n = n, popup = popup,
+                 label = if (n == 1) sprintf("%s · %s", p$name[1], p$place[1]) else sprintf("%s · %d vendors", p$place[1], n),
+                 stringsAsFactors = FALSE)
+    })
+    do.call(rbind, unname(g))
+  })
+  # what "Look up all missing" would work on: sites without coordinates + vendor HQs not yet on the map
+  geo_todo <- reactive({
+    s <- sites_all(); v <- vendors_df()
+    list(sites = sum(is.na(s$lat) | is.na(s$lon)), vendors = if (nrow(v)) sum(hq_needs(v)) else 0L)
+  })
+  output$m_geo_n <- renderUI({
+    n <- sum(unlist(geo_todo()))
+    if (n > 0) span(class = "geo-n", n)
+  })
+
+  output$map_legend <- renderUI({
+    s <- map_sites(); vp <- vendor_pins()
+    div(class = "map-legend",
+        lapply(REGION_LEVELS[REGION_LEVELS %in% c(REGIONS, s$region)], function(k)
+          span(tags$i(style = sprintf("background:%s", region_color(k))), k, span(class = "n", sum(s$region == k)))),
+        if (!is.null(vp)) tagList(span(class = "sep"), span(tags$i(class = "ring"), "Vendor HQ", span(class = "n", sum(vp$n)))))
+  })
+  # the map never just sits there empty: say why, and what to do
+  output$map_empty <- renderUI({
+    s <- map_sites(); all <- sites_all()
+    if (nrow(located(s)) || !is.null(vendor_pins())) return(NULL)
+    can_geo <- geocode_available()
+    msg <- if (!nrow(all)) c("No sites yet", "Sites appear here as quotes are saved or SharePoint is scanned.")
+           else if (!nrow(s)) c("No sites in this region", "Clear the region filter, or scan that region in SharePoint.")
+           else c(sprintf("%d site%s need%s a location", nrow(s), if (nrow(s) == 1) "" else "s", if (nrow(s) == 1) "s" else ""),
+                  if (can_geo) "Place them from their city and country, or enter coordinates in the panel on the right."
+                  else "Add coordinates in the panel on the right, or fill in data/sites_seed.csv and restart the app.")
+    div(class = "map-empty", div(h6(msg[1]), p(msg[2]),
+        if (can_geo && nrow(s))
+          tags$button(type = "button", class = "btn btn-primary btn-sm",
+                      onclick = "Shiny.setInputValue('m_geoall', Date.now(), {priority: 'event'})",
+                      icon("location-crosshairs"), " Look up all missing")))
+  })
+
+  if (HAS_LEAFLET) {
+    site_popup <- function(p) {
+      where <- vapply(seq_len(nrow(p)), function(i) paste(na.omit(c(p$city[i], p$country[i])), collapse = ", "), "")
+      sprintf(paste0("<div class='mpop'><div class='mpop-t'>%s</div><div class='mpop-s'>%s %s %s</div>",
+                     "<div class='mpop-g'><div><span>Quotes</span><b>%d</b></div><div><span>Total quoted</span><b>%s</b></div></div>",
+                     "<div class='mpop-v'>%s</div>%s</div>"),
+              htmlEscape(nna(p$name, p$site_code)), region_chip_html(p$region), htmlEscape(where),
+              ifelse(p$source %in% "geocoded", "<span class='approx'>approximate</span>", ""),
+              p$n_quotes, fmt_compact(p$quoted),
+              ifelse(nzchar(p$vendors), paste0("<b>Vendors</b> ", htmlEscape(p$vendors)), "No quotes saved for this site yet."),
+              ifelse(p$n_quotes > 0,
+                     sprintf("<button type='button' class='btn btn-primary btn-sm w-100' data-site='%s' onclick=\"Shiny.setInputValue('map_goto', this.dataset.site, {priority: 'event'})\">View these quotes</button>",
+                             htmlEscape(p$site_code, attribute = TRUE)), ""))
+    }
+    # fit the view to the markers shown (one marker, or a tight cluster, gets a sensible zoom instead of street level)
+    fit_map <- function(m, pts) {
+      if (!nrow(pts)) return(leaflet::setView(m, lng = 0, lat = 25, zoom = 2))
+      if (nrow(pts) == 1 || (diff(range(pts$lon)) < 0.05 && diff(range(pts$lat)) < 0.05))
+        return(leaflet::setView(m, lng = mean(pts$lon), lat = mean(pts$lat), zoom = 8))
+      leaflet::fitBounds(m, min(pts$lon), min(pts$lat), max(pts$lon), max(pts$lat), options = list(padding = c(50, 50), maxZoom = 9))
+    }
+    # everything that is on the map right now, as lon / lat (for "Fit all")
+    shown_pts <- function(pts, vp) rbind(pts[, c("lon", "lat")], if (!is.null(vp)) vp[, c("lon", "lat")])
+    output$site_map <- leaflet::renderLeaflet({
+      pts <- located(map_sites()); vp <- vendor_pins()
+      m <- map_tiles(leaflet::leaflet(options = leaflet::leafletOptions(minZoom = 2, worldCopyJump = TRUE)))
+      if (nrow(pts)) {
+        pts <- pts[order(-pts$quoted), , drop = FALSE]                 # big circles first so small ones stay clickable
+        mx <- max(pts$quoted, 1)
+        m <- leaflet::addCircleMarkers(m, lng = pts$lon, lat = pts$lat, layerId = pts$site_code, group = "Sites",
+               radius = ifelse(pts$quoted > 0, 9 + 19 * sqrt(pts$quoted / mx), 7),   # area ~ total quoted
+               stroke = TRUE, color = "#ffffff", weight = 2, opacity = 1,
+               fillColor = region_color(pts$region), fillOpacity = 0.88,
+               label = sprintf("%s · %s", nna(pts$name, pts$site_code), fmt_compact(pts$quoted)),
+               popup = site_popup(pts))
+      }
+      if (!is.null(vp)) {                                              # vendor HQs: hollow rings, so they never read as sites
+        m <- leaflet::addCircleMarkers(m, lng = vp$lon, lat = vp$lat, group = "Vendor HQs",
+               radius = 6 + 2.5 * sqrt(vp$n),
+               stroke = TRUE, color = "#0f172a", weight = 2.5, opacity = 1,
+               fillColor = "#ffffff", fillOpacity = 0.95,
+               label = vp$label, popup = vp$popup)
+        m <- leaflet::addLayersControl(m, overlayGroups = c("Sites", "Vendor HQs"), position = "topright",
+               options = leaflet::layersControlOptions(collapsed = FALSE))
+      }
+      fit_map(m, shown_pts(pts, vp))
+    })
+    observeEvent(input$m_fit, fit_map(leaflet::leafletProxy("site_map"), shown_pts(located(map_sites()), vendor_pins())))
+    observeEvent(input$m_zoom, {
+      reg <- intersect(input$m_region, REGIONS)
+      if (!length(reg)) { showNotification("Pick a region in the box next to this button first.", type = "warning"); return() }
+      pts <- located(map_sites()); pts <- pts[pts$region %in% reg, , drop = FALSE]
+      px <- leaflet::leafletProxy("site_map")
+      if (nrow(pts)) fit_map(px, pts) else {                           # nothing located there yet: show the region itself
+        b <- do.call(rbind, REGION_BOX[reg])
+        leaflet::fitBounds(px, min(b[, 1]), min(b[, 2]), max(b[, 3]), max(b[, 4]))
+      }
+    })
+  }
+  # popup button -> Quotes tab filtered to that site
+  observeEvent(input$map_goto, {
+    for (id in c("f_region", "f_trade", "f_vendor", "f_status")) updateSelectizeInput(session, id, selected = character(0))
+    updateTextInput(session, "f_text", value = "")
+    updateSelectizeInput(session, "f_site", selected = input$map_goto)
+    nav_select("nav", "quotes")
+  })
+
+  # vendor popup button -> Vendors tab, searching for that headquarters
+  observeEvent(input$map_goto_vendor, {
+    updateSelectizeInput(session, "v_region", selected = character(0))
+    updateTextInput(session, "v_search", value = input$map_goto_vendor)
+    nav_select("nav", "vendors")
+  })
+
+  # One short note for what was placed and one warning for what wasn't. `res` comes from geocode_pending().
+  geo_report <- function(res) {
+    o <- res$out
+    if (is.null(o) || !nrow(o)) return(invisible())
+    plural <- function(n, w) sprintf("%d %s%s", n, w, if (n == 1) "" else "s")
+    names_of <- function(x) { x <- unique(x); paste0(paste(head(x, 4), collapse = ", "), if (length(x) > 4) sprintf(" and %d more", length(x) - 4) else "") }
+    done <- o[o$status == "done", , drop = FALSE]
+    ns <- sum(done$kind == "site"); nv <- sum(done$kind == "vendor")
+    if (ns + nv)
+      showNotification(sprintf("Placed %s on the map. %s as approximate: the point is the city centre.",
+                               paste(c(if (ns) plural(ns, "site"), if (nv) plural(nv, "vendor HQ")), collapse = " and "),
+                               if (ns + nv == 1) "It shows" else "They show"),
+                       type = "message", duration = 8)
+    bad <- o[o$status == "failed", , drop = FALSE]; skp <- o[o$status == "skipped", , drop = FALSE]
+    bs <- bad$label[bad$kind == "site"]; bv <- bad$label[bad$kind == "vendor"]
+    msg <- c(
+      if (isTRUE(res$stopped)) sprintf("Stopped early: the first look-ups found nothing, so this computer may not be able to reach the look-up service. %d not tried.", res$untried),
+      if (length(bs)) sprintf("No match for %s %s. Enter %s coordinates in the panel on the right.",
+                              if (length(unique(bs)) == 1) "site" else "sites", names_of(bs), if (length(unique(bs)) == 1) "its" else "their"),
+      if (length(bv)) sprintf("No match for the headquarters of %s. Check the spelling on the Vendors tab.", names_of(bv)),
+      if (nrow(skp)) sprintf("No city or country on file for %s. Add them in the panel on the right.", names_of(skp$label)))
+    if (length(msg)) showNotification(paste(msg, collapse = " "), type = "warning", duration = 15)
+    invisible()
+  }
+  # Look up every site and vendor HQ that has no location yet. Only blanks are filled; a location typed in by
+  # hand, or set from the seed file, is never replaced.
+  observeEvent(input$m_geoall, {
+    if (!geocode_available()) {
+      showNotification(HTML("Look-up needs the <code>tidygeocoder</code> package. In R run <code>install.packages(\"tidygeocoder\")</code> and restart the app."),
+                       type = "warning", duration = 12)
+      return()
+    }
+    if (sum(unlist(geo_todo())) == 0) {
+      showNotification("Every site and vendor headquarters already has a location.", type = "message"); return()
+    }
+    res <- tryCatch(
+      withProgress(message = "Looking up locations…", value = 0, {
+        geocode_pending(on_step = function(i, n, label) setProgress(value = (i - 1) / n, detail = sprintf("%d of %d · %s", i, n, label)))
+      }),
+      error = function(e) { showNotification(paste("Look-up failed:", conditionMessage(e)), type = "error", duration = 12); NULL })
+    if (is.null(res)) return()
+    geo_report(res)
+    sites_v(sites_v() + 1); bump()
+  })
+
+  # sites without coordinates are listed, never silently dropped
+  ms_sel <- reactiveVal(NULL); last_geo <- reactiveVal(NULL)
+  observeEvent(input$ms_site, ms_sel(input$ms_site))
+  observeEvent(input$ms_pick, ms_sel(input$ms_pick))
+  site_sub <- function(r) paste(c(r$site_code, na.omit(c(r$city, r$country)),
+                                  if (r$n_quotes > 0) sprintf("%d quote%s", r$n_quotes, if (r$n_quotes == 1) "" else "s")), collapse = " · ")
+  output$map_needs <- renderUI({
+    s <- sites_all(); need <- s[is.na(s$lat) | is.na(s$lon), , drop = FALSE]
+    need <- need[order(-need$n_quotes, need$site_code), , drop = FALSE]
+    # which of them a look-up could place: it needs a city and a country (from the site or from its quotes)
+    sm <- sites_missing()
+    can <- setNames(vapply(seq_len(nrow(sm)), function(i) !is.na(site_query(sm$city[i], sm$country[i], sm$state[i])), NA), sm$site_code)
+    # vendor headquarters: how many are on the map, and which are still waiting
+    v <- vendors_df()
+    vnote <- if (nrow(v)) {
+      pend <- v$name[hq_needs(v)]; none <- sum(is.na(hq_text(v)))
+      div(class = "map-note", icon("building"), span(paste(c(
+        sprintf("Vendor headquarters on the map: %d of %d.", sum(hq_fresh(v)), nrow(v)),
+        if (length(pend)) sprintf("Waiting for a look-up: %s%s.", paste(head(pend, 3), collapse = ", "),
+                                  if (length(pend) > 3) sprintf(" and %d more", length(pend) - 3) else ""),
+        if (none) sprintf("%d with no headquarters on file.", none)), collapse = " ")))
+    }
+    card(class = "mb-3",
+      card_header(div(span(class = "card-t", "Needs location"), span(class = "badge-n", nrow(need)),
+                      div(class = "card-sub", "Not on the map until they have coordinates. Click one to place it",
+                          if (geocode_available()) ", or use Look up all missing." else "."))),
+      card_body(fillable = FALSE,
+        if (!nrow(need)) div(class = "msg ok", style = "margin-top:0", icon("circle-check"),
+                             span(if (nrow(s)) "Every site has a location." else "No sites yet."))
+        else tagList(
+          div(style = "max-height:300px;overflow:auto", lapply(seq_len(nrow(need)), function(i) {
+            r <- need[i, ]
+            div(class = "site-row", onclick = js_set("ms_pick", r$site_code),
+                div(style = "min-width:0", tags$b(nna(r$name, r$site_code)), div(class = "sub", site_sub(r)),
+                    if (geocode_available() && isFALSE(unname(can[r$site_code])))
+                      div(class = "hint", "Add a city and country to place it automatically")),
+                region_chip(r$region))
+          }))),
+        vnote))
+  })
+  output$map_editor <- renderUI({
+    s <- sites_all(); if (!nrow(s)) return(NULL)
+    need <- is.na(s$lat) | is.na(s$lon)
+    ch <- setNames(s$site_code, paste0(nna(s$name, s$site_code), ifelse(need, "  (needs location)", "")))
+    ch <- ch[order(!need, names(ch))]
+    sel <- ms_sel(); if (is.null(sel) || !sel %in% s$site_code) sel <- ch[[1]]
+    r <- s[s$site_code == sel, , drop = FALSE]
+    # the fields are rebuilt for the selected site, so values from one site can never be saved onto another
+    card(card_header(div(span(class = "card-t", "Site location"),
+                         if (r$source %in% "geocoded") span(class = "approx ms-2", "approximate"),
+                         div(class = "card-sub", site_sub(r)))),
+      card_body(fillable = FALSE,
+        selectizeInput("ms_site", "Site", choices = ch, selected = sel, width = "100%"),
+        layout_columns(col_widths = c(6, 6),
+          numericInput("ms_lat", "Latitude", value = r$lat, min = -90, max = 90, step = 0.0001),
+          numericInput("ms_lon", "Longitude", value = r$lon, min = -180, max = 180, step = 0.0001)),
+        layout_columns(col_widths = c(6, 6),
+          textInput("ms_city", "City", nna(r$city)), textInput("ms_country", "Country", nna(r$country))),
+        div(class = "d-flex gap-2 flex-wrap",
+            actionButton("ms_save", "Save location", icon = icon("check"), class = "btn-primary"),
+            if (geocode_available()) actionButton("ms_geo", "Look up city", icon = icon("location-crosshairs"), class = "btn-light")),
+        div(class = "text-muted small mt-2",
+            "Decimal degrees, e.g. 32.7767 and -96.7970. In most map apps you can right-click a place and copy its coordinates. ",
+            if (geocode_available()) "Look up fills in the city centre only; it is saved as approximate until you correct it."
+            else "City look-up is off (it needs the optional tidygeocoder package and internet access).")))
+  })
+  observeEvent(input$ms_geo, {
+    ll <- withProgress(message = "Looking up the city…", value = 0.5, geocode_place(input$ms_city, input$ms_country))
+    if (is.null(ll)) { showNotification("No result, or no internet access from this machine. Enter the coordinates by hand.", type = "warning"); return() }
+    updateNumericInput(session, "ms_lat", value = ll[["lat"]]); updateNumericInput(session, "ms_lon", value = ll[["lon"]])
+    last_geo(list(code = input$ms_site, ll = unname(ll)))
+    showNotification("Filled in the city centre. Check it, then press Save: it is stored as approximate.", type = "message", duration = 8)
+  })
+  observeEvent(input$ms_save, {
+    code <- input$ms_site; req(code)
+    lat <- input$ms_lat %||% NA_real_; lon <- input$ms_lon %||% NA_real_
+    if (xor(is.na(lat), is.na(lon))) { showNotification("Enter both latitude and longitude, or leave both empty.", type = "warning"); return() }
+    if (!is.na(lat) && (abs(lat) > 90 || abs(lon) > 180)) {
+      showNotification("Latitude must be between -90 and 90, longitude between -180 and 180.", type = "warning"); return()
+    }
+    g <- last_geo()   # still exactly what the look-up returned? then it is an approximate (geocoded) point
+    src <- if (!is.na(lat) && !is.null(g) && identical(g$code, code) && isTRUE(all.equal(c(lat, lon), g$ll))) "geocoded" else "manual"
+    ok <- tryCatch({ save_site(code, lat, lon, input$ms_city, input$ms_country, src); TRUE },
+                   error = function(e) { showNotification(paste("Couldn't save:", conditionMessage(e)), type = "error"); FALSE })
+    if (ok) { showNotification(if (is.na(lat)) "Site saved without coordinates." else "Location saved: the site is on the map.", type = "message")
+              sites_v(sites_v() + 1) }
+  })
 }
+
 
 shinyApp(ui, server)
